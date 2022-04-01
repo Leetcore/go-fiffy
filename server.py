@@ -3,7 +3,6 @@ import re
 import logging
 import time
 import threading
-import html
 import random
 from typing_extensions import TypeGuard
 from urllib.parse import urlparse
@@ -11,10 +10,13 @@ import cherrypy
 import sqlite3
 from bs4 import BeautifulSoup
 import requests
+import frontend
 
 logging.basicConfig(level=logging.DEBUG)
 db_name = "./index.db"
+visited_urls = []
 queue = []
+language_list = ["de", "en"]
 start_url_list = [
 	"https://www.1337core.de/",
 	"https://de.wikipedia.org/",
@@ -23,27 +25,25 @@ start_url_list = [
 	"https://www.heise.de/"
 ]
 
-
 def main():
 	init_db()
 	load_saved_queue()
 	threading.Thread(target=loop_queue_worker).start()
 	cherrypy.quickstart(WebServer())
 
-
 class WebServer(object):
 	@cherrypy.expose
-	def index(self, query=None):
+	def index(self, query=None, language=None):
 		if query:
 			return f"""
-			{get_html_header(query)}
+			{frontend.get_html_header(query)}
 			{get_query_result(query)}
-			{get_html_footer()}
+			{frontend.get_html_footer()}
 			"""
 		else:
 			return f"""
-			{get_html_header()}
-			{get_html_footer()}
+			{frontend.get_html_header()}
+			{frontend.get_html_footer()}
 			"""
 
 def init_db():
@@ -59,6 +59,7 @@ def init_db():
 			url				TEXT	NOT NULL,
 			title			TEXT	NOT NULL,
 			description		TEXT	NOT NULL,
+			language		TEXT	NOT NULL,
 			quality			INTEGER	NOT NULL);
 			"""
 		)
@@ -79,7 +80,6 @@ def init_db():
 	db.commit()
 	db.close()
 
-
 def load_saved_queue():
 	db = sqlite3.connect(db_name)
 	result_queue = db.execute("SELECT * FROM 'queue'").fetchall()
@@ -89,34 +89,27 @@ def load_saved_queue():
 	for result in result_queue:
 		queue.append(result[1])
 
-
 def get_query_result(query):
 	db = sqlite3.connect(db_name)
-	query_parts = query.split(" ")
-	results = []
 	# full title hit
 	db = sqlite3.connect(db_name)
-	result_query_titles = db.execute("	SELECT * FROM 'index' WHERE TITLE LIKE (?)", [query]).fetchmany(1000)
+	result_query_titles = db.execute("SELECT * FROM 'index' WHERE title LIKE (?) OR description LIKE (?)", [f"%{query}%", f"%{query}%"]).fetchmany(1000)
 	db.close()
 	if result_query_titles:
-		return get_result_list(result_query_titles)
+		return frontend.get_result_list(result_query_titles)
 	return "NOT FOUND"
 
-
-
-
-def insert_in_db(url, title, description, quality):
+def insert_in_db(url, title, description, language, quality):
 	db = sqlite3.connect(db_name)
 	logging.debug(f"Insert in index: {url}")
 	db.execute(
-		f"""INSERT INTO 'index' (url, title, description, quality)  
-		VALUES (?, ?, ?, ?);
-		""", (url, title, description, quality)
+		f"""INSERT INTO 'index' (url, title, description, language, quality)  
+		VALUES (?, ?, ?, ?, ?);
+		""", (url, title, description, language, quality)
 	)
 	db.commit()
 	db.close()
 	return True
-
 
 def save_queue_in_db():
 	db = sqlite3.connect(db_name)
@@ -127,7 +120,6 @@ def save_queue_in_db():
 		)
 	db.commit()
 	db.close()
-
 
 def loop_queue_worker():
 	counter = 0
@@ -141,26 +133,30 @@ def loop_queue_worker():
 			random.shuffle(queue)
 			save_queue_in_db()
 
-
 def add_queue(url):
 	if url not in queue and not is_in_index(url):
 		queue.append(url)
-
 
 def add_queue_top(url):
 	if url not in queue and not is_in_index(url):
 		queue.insert(0, url)
 
-
 def is_in_index(url):
 	db = sqlite3.connect(db_name)
-	bool_result = db.execute("SELECT * from 'index' WHERE url = (?)", [url]).fetchone()
+	result = db.execute("SELECT * from 'index' WHERE url = (?)", [url]).fetchone()
 	db.commit()
 	db.close()
-	return bool_result
-
+	if result is None:
+		return False
+	else:
+		return True
 
 def crawl_site(url):
+	# filter already visited urls
+	if url in visited_urls:
+		return
+	visited_urls.append(url)
+
 	# request website
 	logging.debug(f"Crawl url: {url}")
 	site_response = request_url(url)
@@ -174,17 +170,15 @@ def crawl_site(url):
 
 	# parsed current url
 	parsed_url = urlparse(site_response.url)
-	base_tag = soup.find("base")
-	# link_array = re.findall(
-	# 	r"(http|https):\/\/([\w\-_]+(?:(?:\.[\w\-_]+)+))([\w\-\.,@?^=%&:/~\+#]*[\w\-\@?^=%&/~\+#])?",
-	# 	site_response.text,
-	# )
 
-	# # get http links
-	# for link_parts in link_array:
-	# 	full_url = link_parts[0] + "://" + link_parts[1] + link_parts[2]
-	# 	if parsed_url.hostname in full_url:
-	# 		add_queue(full_url)
+	# check language
+	language = ""
+	if soup.find("html"):
+		if soup.find("html").attrs.get("lang"):
+			language = soup.find("html").attrs.get("lang").lower()
+	if language not in language_list:
+		logging.debug("NO INDEX: WRONG LANGUAGE")
+		return
 
 	# get html links
 	a_tags = soup.find_all("a")
@@ -193,8 +187,12 @@ def crawl_site(url):
 		link = a_tag.attrs.get("href")
 		if not link:
 			continue
+		link = link.lower()
 
-		if link and link.startswith("/"):
+		if link.startswith("java"):
+			continue
+
+		if link.startswith("/"):
 			port = ""
 			if parsed_url.port:
 				port = ":" + str(parsed_url.port)
@@ -202,23 +200,22 @@ def crawl_site(url):
 				parsed_url.scheme + "://" + parsed_url.hostname + port + link
 			)
 			add_queue(full_link)
-
-		# check base tag urls
-		if base_tag:
-			base = base_tag.attrs.get("href")
-			if base:
-				port = ""
-				if parsed_url.port:
-					port = ":" + str(parsed_url.port)
-				full_link = parsed_url.scheme + "://" + base + port + link
-				add_queue(full_link)
+			continue
 
 		# absolut urls to same domain
-		if link and link.startswith("http"):
+		if link.startswith("https"):
 			if parsed_url.hostname in link:
 				add_queue(link)
 			else:
 				add_queue_top(link)
+			continue
+
+		# check base tag urls
+		base_tag = soup.find("base")
+		if base_tag:
+			base = base_tag.attrs.get("href")
+			add_queue(base + link)
+			continue
 
 	# save urls in index
 	title = ""
@@ -228,20 +225,22 @@ def crawl_site(url):
 		title = title.replace("\t", "").replace("\n", " ")
 	
 	# check quality
-	if len(soup.findAll("p")) >= 3 and len(title) > 0:
-		get_paras = []
-		for par in soup.findAll("p"):
-			get_paras.append(par.get_text())
-		all_paras = " ".join(get_paras)
-		if len(all_paras) >= 500:
-			description = " ".join(get_paras)
-			description = description.replace("\t", "").replace("\n", " ")
-			insert_in_db(url, title, description[0:500], 0)
-		else:
-			logging.debug("NO INDEX: NOT ENOUGH TEXT")
-	else:
+	if len(soup.findAll("p")) < 3 and len(title) == 0:
 		logging.debug("NO INDEX: NOT ENOUGH PARAGRAPHS OR TITLE")
+		return
 
+	# check quality
+	get_paras = []
+	for par in soup.findAll("p"):
+		get_paras.append(par.get_text())
+	all_paras = " ".join(get_paras)
+	if len(all_paras) < 500:
+		logging.debug("NO INDEX: NOT ENOUGH TEXT")
+		return
+
+	description = all_paras
+	description = description.replace("\t", "").replace("\n", " ")
+	insert_in_db(url, title, description[0:500], language, 0)
 
 def request_url(url):
 	try:
@@ -249,11 +248,11 @@ def request_url(url):
 		session.headers[
 			"User-Agent"
 		] = "Bester Crawler der Welt!"
-		header = session.head(url=url, timeout=5)
+		header = session.head(url=url, timeout=3)
 
 		# check status code
-		if header.status_code >= 300:
-			logging.debug("NO CRAWL: HTTP Error Code!")
+		if header.status_code >= 400:
+			logging.debug(f"NO CRAWL: HTTP Error Code: {header.status_code}")
 			return False
 
 		# check content size
@@ -263,7 +262,7 @@ def request_url(url):
 
 		# check content type
 		one_allowed_content_type = False
-		for allowed_content_type in ["html", "plain", "xml", "text", "json"]:
+		for allowed_content_type in ["html", "plain", "text"]:
 			if (
 				not header.headers.get("content-type")
 				or allowed_content_type in header.headers.get("content-type").lower()
@@ -280,31 +279,8 @@ def request_url(url):
 		logging.debug(e)
 		return False
 
-def get_html_header(query=None):
-	if not query:
-		query = ""
-	return f"""
-	<html><body>
-		<h1>Suchmaschine</h1>
-		<form method="GET">
-			<input type="text" name="query" value="{html.escape(query)}"/>
-			<button>Suche</button>
-		</form>
-	"""
-
-def get_html_footer():
-	return "</body></html>"
-
-def get_result_list(db_results):
-	result = "<li>"
-	for result in db_results:
-		result = f"{result}{html.escape(result[1])}"
-	result = f"{result}</li>"
-	return result
-
 def __del__():
 	save_queue_in_db()
-
 
 if __name__ == "__main__":
 	main()
