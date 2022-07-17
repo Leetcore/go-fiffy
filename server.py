@@ -1,10 +1,7 @@
-import os
-import re
 import logging
 import time
 import threading
 import random
-from typing_extensions import TypeGuard
 from urllib.parse import urlparse
 import cherrypy
 import sqlite3
@@ -15,7 +12,7 @@ import frontend
 logging.basicConfig(level=logging.DEBUG)
 db_name = "./index.db"
 visited_urls = []
-queue = []
+queue: list[str] = []
 language_list = ["de", "en"]
 start_url_list = [
 	"https://www.1337core.de/",
@@ -89,7 +86,7 @@ def load_saved_queue():
 	for result in result_queue:
 		queue.append(result[1])
 
-def get_query_result(query):
+def get_query_result(query: str):
 	db = sqlite3.connect(db_name)
 	# full title hit
 	db = sqlite3.connect(db_name)
